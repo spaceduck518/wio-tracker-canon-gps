@@ -1,0 +1,35 @@
+# Eigene Board-Definition fuer den Seeed Wio Tracker L1 / L1 Pro
+# Nutzt den Core aus "Seeed nRF52 Boards" (Seeeduino:nrf52, SoftDevice S140 7.3.0).
+# Pinbelegung nach dem Meshtastic-Variant "seeed_wio_tracker_L1" (variant.cpp).
+
+menu.debug=Debug
+
+wiotrackerl1.name=Seeed Wio Tracker L1 / L1 Pro (eigene Definition)
+wiotrackerl1.vid.0=0x2886
+wiotrackerl1.pid.0=0x8044
+wiotrackerl1.bootloader.tool=bootburn
+wiotrackerl1.upload.tool=nrfutil
+wiotrackerl1.upload.protocol=nrfutil
+wiotrackerl1.upload.use_1200bps_touch=true
+wiotrackerl1.upload.wait_for_upload_port=true
+wiotrackerl1.upload.maximum_size=811008
+wiotrackerl1.upload.maximum_data_size=237568
+wiotrackerl1.build.mcu=cortex-m4
+wiotrackerl1.build.f_cpu=64000000
+wiotrackerl1.build.board=WIO_TRACKER_L1
+wiotrackerl1.build.core=Seeeduino:nRF5
+wiotrackerl1.build.variant=WioTrackerL1
+wiotrackerl1.build.usb_manufacturer="Seeed"
+wiotrackerl1.build.usb_product="Wio Tracker L1"
+# Wire_nRF52.cpp kennt nur Seeed-Boards -> als XIAO ausgeben (betrifft nur diese Pruefung)
+wiotrackerl1.build.extra_flags=-DNRF52840_XXAA -DARDUINO_Seeed_XIAO_nRF52840 {build.flags.usb}
+wiotrackerl1.build.ldscript=nrf52840_s140_v7.ld
+wiotrackerl1.build.vid=0x2886
+wiotrackerl1.build.pid=0x8044
+wiotrackerl1.build.sd_name=s140
+wiotrackerl1.build.sd_version=7.3.0
+wiotrackerl1.build.sd_fwid=0x0123
+wiotrackerl1.menu.debug.l0=Level 0 (Release)
+wiotrackerl1.menu.debug.l0.build.debug_flags=-DCFG_DEBUG=0
+wiotrackerl1.menu.debug.l1=Level 1 (Error Message)
+wiotrackerl1.menu.debug.l1.build.debug_flags=-DCFG_DEBUG=1

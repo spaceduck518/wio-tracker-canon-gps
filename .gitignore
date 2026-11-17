@@ -1,0 +1,22 @@
+# Serial logs can contain real GPS positions - never commit them
+*.log
+
+# Firmware backups read from a device (may contain keys/settings of the previous firmware)
+firmware-backup/
+CURRENT.UF2
+
+# Local build output / debug symbols
+build/
+*.elf
+*.hex
+*.map
+*.zip
+!prebuilt/*.uf2
+!prebuilt/*.elf
+
+# Editor / OS clutter
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
