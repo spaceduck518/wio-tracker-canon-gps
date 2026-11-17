@@ -30,6 +30,7 @@
  *   s status   r reconnect   x delete pairing   l toggle language
  *   h listen-only diagnostic (count camera adverts, never connect)
  *   Z deliberately crash (tests the crash log)
+ *   D demo mode   v next display page   k next menu entry   P framebuffer dump (screenshot)
  *
  * Code comments are mostly in German (the original author's language).
  */
@@ -49,7 +50,7 @@ using namespace Adafruit_LittleFS_Namespace;
 
 // ============================ Einstellungen ============================
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
 static const char *DEVICE_NAME = "Wio GPS";          // erscheint an der Kamera
 
 // Auswahl im Einstellungsmenue (Standard = Index in Klammern)
@@ -149,6 +150,9 @@ static bool   lastWasMinimal = false;
 static uint8_t  secureFails = 0;
 
 static char seenName[24] = "";
+// Demo-Modus fuer Screenshots: Beispielwerte statt echter Position/Kamera (Befehl 'D')
+static bool demoMode = false;
+static const uint32_t DEMO_EPOCH = 1781950530;   // 2026-06-20 10:15:30 UTC
 static char lastResetInfo[24] = "";   // letzter Absturz/Watchdog, fuer die Seite "Geraet"
 
 // gespeicherte Daten (InternalFS)
@@ -414,6 +418,11 @@ static const char *gnssStartText() {
 
 static GpsFix gpsRead() {
   GpsFix f = {};
+  if (demoMode) {                       // Brandenburger Tor, Berlin
+    f.valid = true; f.lat = 52.516275; f.lon = 13.377704; f.alt = 34.6;
+    f.speed = 1.3; f.course = 82; f.sats = 11; f.view = 18; f.epoch = DEMO_EPOCH;
+    return f;
+  }
   f.sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
   f.view = satsInView();
   if (!gps.location.isValid() || gps.location.age() > GPS_MAX_AGE_MS || !gpsTimeValid()) return f;
@@ -545,6 +554,7 @@ static void showToast(const char *msg) {
 
 static const char *stateText() {
   if (toastMsg[0] && (int32_t)(millis() - toastUntil) < 0) return toastMsg;
+  if (demoMode) return TR("GPS -> Kamera", "GPS -> camera");
   if (remoteSeen && state == State::SCAN) return TR("Fernbed.-Modus!", "Remote mode!");
   if (state == State::SCAN && persist.haveCam && camSeen && !camOn) return TR("Kamera aus", "Camera off");
   if (state == State::SCAN && persist.haveCam && camOn && !connectAllowed) return TR("Kamera an, warte...", "Camera on, waiting...");
@@ -633,7 +643,7 @@ static void drawPageStatus(const GpsFix &f) {
   char line[32];
   drawHeader("Canon GPS");
   oled.drawStr(OX, 22, stateText());
-  oled.drawStr(OX, 32, persist.haveCam ? persist.camName : (seenName[0] ? seenName : "-"));
+  oled.drawStr(OX, 32, demoMode ? "EOSR6m2_123456" : persist.haveCam ? persist.camName : (seenName[0] ? seenName : "-"));
   if (!gnssFound) {
     snprintf(line, sizeof(line), "%s", gnssStartText());
   } else if (f.valid) {
@@ -658,7 +668,8 @@ static void drawPageGps(const GpsFix &f) {
   drawHeader("GPS");
   snprintf(line, sizeof(line), TR("Satelliten: %u/%u", "Satellites: %u/%u"), f.sats, f.view);
   oled.drawStr(OX, 22, line);
-  if (gps.hdop.isValid()) snprintf(line, sizeof(line), "HDOP: %.1f", gps.hdop.hdop());
+  if (demoMode) snprintf(line, sizeof(line), "HDOP: 0.8");
+  else if (gps.hdop.isValid()) snprintf(line, sizeof(line), "HDOP: %.1f", gps.hdop.hdop());
   else snprintf(line, sizeof(line), "HDOP: -");
   oled.drawStr(OX, 32, line);
   if (f.valid) {
@@ -666,7 +677,7 @@ static void drawPageGps(const GpsFix &f) {
     oled.drawStr(OX, 42, line);
     snprintf(line, sizeof(line), "%.1f km/h  %03.0f%c", f.speed * 3.6, f.course, 0xb0);
     oled.drawStr(OX, 52, line);
-    snprintf(line, sizeof(line), TR("Fix-Alter: %.1f s", "Fix age: %.1f s"), gps.location.age() / 1000.0);
+    snprintf(line, sizeof(line), TR("Fix-Alter: %.1f s", "Fix age: %.1f s"), demoMode ? 0.4 : gps.location.age() / 1000.0);
   } else {
     snprintf(line, sizeof(line), "%s", gnssFound ? TR("kein Fix", "no fix") : gnssStartText());
   }
@@ -684,13 +695,15 @@ static void drawPageDevice() {
   snprintf(line, sizeof(line), TR("Laufzeit: %lu:%02lu:%02lu", "Uptime: %lu:%02lu:%02lu"),
            (unsigned long)(up / 3600), (unsigned long)(up / 60 % 60), (unsigned long)(up % 60));
   oled.drawStr(OX, 42, line);
-  if (persist.haveCam) {
+  if (demoMode) {
+    oled.drawStr(OX, 52, "aa:bb:cc:11:22:33");
+  } else if (persist.haveCam) {
     addrToStr(persist.addr, line);
     oled.drawStr(OX, 52, line);
   } else {
     oled.drawStr(OX, 52, TR("Keine Kamera gepairt", "No camera paired"));
   }
-  if (lastResetInfo[0]) snprintf(line, sizeof(line), "%s", lastResetInfo);
+  if (lastResetInfo[0] && !demoMode) snprintf(line, sizeof(line), "%s", lastResetInfo);
   else snprintf(line, sizeof(line), "%s %s", TR("Name:", "Name:"), DEVICE_NAME);
   oled.drawStr(OX, 62, line);
 }
@@ -741,6 +754,32 @@ static void drawPageSettings() {
   }
 }
 
+static void displayDraw() {
+  GpsFix f = gpsRead();
+  oled.clearBuffer();
+  switch (page) {
+    case PAGE_STATUS:   drawPageStatus(f); break;
+    case PAGE_GPS:      drawPageGps(f); break;
+    case PAGE_DEVICE:   drawPageDevice(); break;
+    case PAGE_SETTINGS: drawPageSettings(); break;
+  }
+}
+
+// Bildspeicher (8 Seiten x 128 Byte, je Byte 8 Pixel senkrecht, Bit 0 oben) als Hex ausgeben.
+// tools/fb2png.py macht daraus ein PNG.
+static void displayDump() {
+  if (!oledPresent) { Serial.println("FB-NONE"); return; }
+  displayDraw();
+  oled.sendBuffer();
+  const uint8_t *buf = oled.getBufferPtr();
+  Serial.printf("FB-BEGIN page=%u\n", page);
+  for (int row = 0; row < 8; row++) {
+    for (int x = 0; x < 128; x++) Serial.printf("%02x", buf[row * 128 + x]);
+    Serial.println();
+  }
+  Serial.println("FB-END");
+}
+
 static void displayUpdate() {
   if (!oledPresent) return;
   uint32_t now = millis();
@@ -753,15 +792,7 @@ static void displayUpdate() {
   static uint32_t last = 0;
   if (!oledOn || now - last < 250) return;
   last = now;
-
-  GpsFix f = gpsRead();
-  oled.clearBuffer();
-  switch (page) {
-    case PAGE_STATUS:   drawPageStatus(f); break;
-    case PAGE_GPS:      drawPageGps(f); break;
-    case PAGE_DEVICE:   drawPageDevice(); break;
-    case PAGE_SETTINGS: drawPageSettings(); break;
-  }
+  displayDraw();
   oled.sendBuffer();
 }
 
@@ -1215,6 +1246,10 @@ static void handleSerial() {
       case 's': printStatus(); break;
       case 'r': if (Bluefruit.connected(connHandle)) Bluefruit.disconnect(connHandle); break;
       case 'l': toggleLang(); break;
+      case 'D': demoMode = !demoMode; Serial.printf("Demo mode: %s\n", demoMode ? "on" : "off"); displayWake(); break;
+      case 'v': page = (page + 1) % PAGE_COUNT; displayWake(); break;      // naechste Display-Seite
+      case 'k': menuSel = (menuSel + 1) % MENU_COUNT; displayWake(); break; // Menue-Auswahl weiter
+      case 'P': displayDump(); break;                                       // Screenshot
       case 'Z': {                                    // Test: absichtlicher Absturz
         Serial.println("Test-Absturz ...");
         Serial.flush();

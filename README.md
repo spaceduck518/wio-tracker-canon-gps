@@ -7,6 +7,8 @@ of every photo – without a phone, without an app, without draining your phone 
 
 Switch it on, put it in your pocket, done.
 
+<p align="center"><img src="docs/images/page-status.png" alt="Status page of the tracker display" width="420"></p>
+
 > Tested with: **Wio Tracker L1 Pro** + **Canon EOS R6 Mark II**.
 > Other Canon cameras that support "location information from a smartphone" via Bluetooth
 > will very likely work too (the protocol is the same as in the
@@ -134,15 +136,14 @@ To pair a different camera, use **Settings → Delete pairing** on the tracker, 
 
 Move the joystick **left/right** to switch pages (the dots in the top line show which one).
 
+<sub>All screenshots below are rendered from the real display framebuffer of a running tracker
+(demo mode with example data, see [Screenshots](#screenshots)). The padlock in the top line
+means the key lock is active.</sub>
+
 **1 – Status**
-```
-Canon GPS        • ▪ • •  87%
-GPS -> camera
-EOSR6m2_XXXXXX
-Sat 9/14  18:35:12
-N 48° 05' 07.2"
-E 10° 51' 42.1"
-```
+
+![Status page](docs/images/page-status.png)
+
 * Line 2: state – `Searching camera...`, `Camera off`, `Camera on, waiting...`,
   `Connecting...`, `Confirm on camera!`, `Connected` (no GPS request yet),
   `GPS -> camera` (sending), `Remote mode!`.
@@ -150,13 +151,19 @@ E 10° 51' 42.1"
   `0/9` = satellites visible but no fix yet (wait).
 * Time is **local time** (CET/CEST). The camera always receives UTC.
 
-**2 – GPS:** satellites, HDOP, altitude, speed and course, age of the fix.
+**2 – GPS:** satellites used/in view, HDOP, altitude, speed and course, age of the fix.
+
+![GPS page](docs/images/page-gps.png)
 
 **3 – Device:** battery voltage, number of packets sent, uptime, Bluetooth address of the paired
 camera, and either the device name or – after an automatic restart – the last crash/watchdog
 address (see [Troubleshooting](#crash-or-watchdog-message-on-the-device-page)).
 
+![Device page](docs/images/page-device.png)
+
 **4 – Settings:** move **up/down** to select, **press** the joystick to change:
+
+![Settings page](docs/images/page-settings.png)
 
 | Setting | Values | Default |
 |---|---|---|
@@ -291,9 +298,24 @@ USB serial, 115200 baud (any terminal; the Arduino serial monitor works). Comman
 | `l` | toggle language |
 | `h` | listen-only diagnostic: never connect, print the camera's advert rate every 10 s |
 | `Z` | deliberately crash (tests the crash log) |
+| `D` | demo mode on/off (example position, camera name and address – for screenshots) |
+| `v` | next display page |
+| `k` | next entry in the settings menu |
+| `P` | print the display framebuffer (screenshot, see below) |
 
 The log shows every pairing step, GPS indications, sent packets (hex) and detected camera on/off
 changes. ⚠️ Logs contain your real position – don't post them unedited.
+
+### Screenshots
+
+The screenshots in this README come straight from the device: `P` prints the 128×64 framebuffer
+as hex, [`tools/fb2png.py`](tools/fb2png.py) turns it into a PNG (needs Pillow).
+
+1. Log the serial port to a file, e.g. on Linux:
+   `stty -F /dev/ttyACM0 115200 raw -echo && cat /dev/ttyACM0 | tee serial.log`
+2. In a second terminal send commands, e.g. `printf D > /dev/ttyACM0` (demo mode, hides your real
+   position), then `printf P > /dev/ttyACM0`, `printf v > /dev/ttyACM0`, `printf P > /dev/ttyACM0` …
+3. `tools/fb2png.py serial.log -o screenshots/` (options: `--scale`, `--gap 1` for an OLED pixel grid look).
 
 ### Configuration in the source
 
