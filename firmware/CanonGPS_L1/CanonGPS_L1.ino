@@ -27,7 +27,7 @@
  *     1 flash / 5 s = sending GPS, 2 flashes / 5 s = connected but no GPS fix.
  *
  * Serial commands (USB CDC, 115200 baud):
- *   s status   r reconnect   x delete pairing   l toggle language
+ *   s status   r reconnect   x delete pairing   l toggle language   c clear crash log
  *   h listen-only diagnostic (count camera adverts, never connect)
  *   Z deliberately crash (tests the crash log)
  *   D demo mode   v next display page   k next menu entry   P framebuffer dump (screenshot)
@@ -50,7 +50,7 @@ using namespace Adafruit_LittleFS_Namespace;
 
 // ============================ Einstellungen ============================
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.1.1"
 static const char *DEVICE_NAME = "Wio GPS";          // erscheint an der Kamera
 
 // Auswahl im Einstellungsmenue (Standard = Index in Klammern)
@@ -118,8 +118,13 @@ static volatile int      pairResult   = -1;
 static volatile bool     geoRequested = false;
 static volatile bool     geoEnabled   = false;
 static volatile bool     remoteSeen   = false;
-static volatile uint32_t connectingSince = 0;
-static volatile int      authStatus   = -1;     // Ergebnis des BLE-Pairings (0 = ok)   // Verbindungsaufbau laeuft (0 = nein)
+static volatile uint32_t connectingSince = 0;  // Verbindungsaufbau laeuft (0 = nein)
+static volatile int      authStatus   = -1;     // Ergebnis des BLE-Pairings (0 = ok)
+static volatile uint32_t lastAdvAt    = 0;      // letztes empfangenes Werbepaket (irgendein Geraet)
+static const uint32_t CONNECT_TIMEOUT_MS = 5000; // Verbindungsaufbau danach abbrechen
+static const uint32_t SCAN_STALL_MS      = 20000; // so lange gar keine Werbung -> Scanner neu starten
+static const uint32_t FIRST_SEND_RETRY_MS = 500;  // erste Position nach dem Verbinden: Wiederholabstand
+static const uint32_t GATT_WRITE_TIMEOUT_MS = 1500;
 static bool needConfirm   = false;
 static bool waitingForUser = false;
 static uint32_t lastGeoSend = 0, geoPacketsSent = 0;
@@ -142,7 +147,7 @@ static const uint32_t AFTER_DISC_MS  = 45000;  // nach Trennen erst so lange "an
 static volatile uint32_t advWin = 0;
 static volatile bool connectAllowed = false;
 static bool camOn = false, camSeen = false;
-static uint32_t lastDisconnectAt = 0;
+static volatile uint32_t lastDisconnectAt = 0;
 // Getestet an der R6 Mark II: ohne Pairing-Abfrage keine GPS-Freigabe -> aus
 static int8_t minimalOk = 0;           // -1 unbekannt (testen), 0 klappt nicht, 1 klappt
 static bool   lastWasMinimal = false;
@@ -153,7 +158,15 @@ static char seenName[24] = "";
 // Demo-Modus fuer Screenshots: Beispielwerte statt echter Position/Kamera (Befehl 'D')
 static bool demoMode = false;
 static const uint32_t DEMO_EPOCH = 1781950530;   // 2026-06-20 10:15:30 UTC
-static char lastResetInfo[24] = "";   // letzter Absturz/Watchdog, fuer die Seite "Geraet"
+static bool haveCrash = false;        // letzter Absturz/Watchdog, fuer die Seite "Geraet"
+static void printCrash();
+static void crashLine(uint8_t i, char *out, size_t n);
+static void crashClear();
+static uint32_t cbStackFree = 0;      // kleinster freier Stack des Callback-Tasks (Bytes)
+static void noteCbStack() {           // nur aus Callbacks (Callback-Task) aufrufen
+  uint32_t f = uxTaskGetStackHighWaterMark(NULL) * 4;
+  if (!cbStackFree || f < cbStackFree) cbStackFree = f;
+}
 
 // gespeicherte Daten (InternalFS)
 struct Persist {
@@ -703,7 +716,7 @@ static void drawPageDevice() {
   } else {
     oled.drawStr(OX, 52, TR("Keine Kamera gepairt", "No camera paired"));
   }
-  if (lastResetInfo[0] && !demoMode) snprintf(line, sizeof(line), "%s", lastResetInfo);
+  if (haveCrash && !demoMode) crashLine((millis() / 2500) % 3, line, sizeof(line));   // wechselt alle 2,5 s
   else snprintf(line, sizeof(line), "%s %s", TR("Name:", "Name:"), DEVICE_NAME);
   oled.drawStr(OX, 62, line);
 }
@@ -889,8 +902,26 @@ static void camPowerUpdate() {
   if (now - t0 >= ADV_WIN_MS) {
     uint32_t n = advWin;
     advWin = 0;
+    uint32_t winStart = t0;
     t0 = now;
     bool seen = n > 0, on = n >= ADV_FAST_MIN;
+    // Nach dem Trennen: Sobald die Kamera langsam wirbt (= wirklich aus), ist die "schnelle
+    // Nachlaufphase" vorbei -> naechstes schnelles Werben heisst eingeschaltet, nicht mehr
+    // AFTER_DISC_MS abwarten. Nur volle Fenster nach dem Trennen zaehlen, zwei in Folge.
+    static uint8_t slowWins = 0;
+    if (lastDisconnectAt && state == State::SCAN && (int32_t)(winStart - lastDisconnectAt) >= 0) {
+      if (seen && !on) {
+        if (++slowWins >= 2) {
+          lastDisconnectAt = 0;
+          Serial.println(TR("Kamera ist aus -> Einschalten wird sofort erkannt.",
+                            "Camera is off -> switching on will be detected right away."));
+        }
+      } else {
+        slowWins = 0;
+      }
+    } else {
+      slowWins = 0;
+    }
     if (state == State::SCAN && persist.haveCam && (on != camOn || seen != camSeen)) {
       Serial.printf(TR("Kamera %s (%lu Werbepakete/3 s)\n", "Camera %s (%lu adverts/3 s)\n"),
                     on ? TR("an", "on") : (seen ? TR("aus", "off") : TR("nicht in Reichweite", "out of range")),
@@ -899,7 +930,8 @@ static void camPowerUpdate() {
     camOn = on;
     camSeen = seen;
   }
-  bool settled = lastDisconnectAt == 0 || now - lastDisconnectAt > AFTER_DISC_MS;
+  if (lastDisconnectAt && now - lastDisconnectAt > AFTER_DISC_MS) lastDisconnectAt = 0;
+  bool settled = lastDisconnectAt == 0;
   connectAllowed = camOn && settled && !listenForced && (int32_t)(now - scanHoldUntil) >= 0;
 }
 
@@ -960,6 +992,7 @@ static void onNameIndication(BLEClientCharacteristic *, uint8_t *data, uint16_t 
 
 static void onGeoIndication(BLEClientCharacteristic *, uint8_t *data, uint16_t len) {
   if (!len) return;
+  noteCbStack();
   Serial.print("<- GPS-Indication: ");
   printHex(data, len);
   Serial.println();
@@ -972,6 +1005,7 @@ static void onPairComplete(uint16_t, uint8_t status) {
 }
 
 static void onConnect(uint16_t h) {
+  noteCbStack();
   connHandle = h;
   disconnected = false;
   connPending = true;
@@ -994,6 +1028,7 @@ static void onDisconnect(uint16_t h, uint8_t reason) {
 }
 
 static void onScan(ble_gap_evt_adv_report_t *r) {
+  lastAdvAt = millis();
   bool smart = Bluefruit.Scanner.checkReportForUuid(r, priSvc.uuid);
   bool remote = Bluefruit.Scanner.checkReportForUuid(r, remoteSvc.uuid);
   uint8_t buf[32];
@@ -1011,6 +1046,7 @@ static void onScan(ble_gap_evt_adv_report_t *r) {
                     (unsigned)(r->type.connectable | (r->type.scannable << 1) | (r->type.directed << 2)), r->rssi);
       printHex(r->data.p_data, rl);
       Serial.println();
+      noteCbStack();
     }
     char name[24] = "";
     if (Bluefruit.Scanner.parseReportByType(r, BLE_GAP_AD_TYPE_COMPLETE_LOCAL_NAME, (uint8_t *)name, sizeof(name) - 1))
@@ -1020,10 +1056,11 @@ static void onScan(ble_gap_evt_adv_report_t *r) {
     if (listenOnly || (stored && !connectAllowed)) { Bluefruit.Scanner.resume(); return; }
     if (smart && (stored || !persist.haveCam)) {
       remoteSeen = false;
-      if (Bluefruit.Central.connect(r)) {
-        connectingSince = millis() | 1;
-        return;
-      }
+      // Achtung: Bluefruit verbindet mit den Scan-Parametern (timeout 0 = endlos) und der
+      // Scanner steht dabei -> loop() bricht den Versuch nach CONNECT_TIMEOUT_MS ab.
+      connectingSince = millis() | 1;
+      if (Bluefruit.Central.connect(r)) return;
+      connectingSince = 0;
     }
     if (remote && !smart) remoteSeen = true;
   }
@@ -1032,8 +1069,56 @@ static void onScan(ble_gap_evt_adv_report_t *r) {
 
 // ===================== Pairing & GPS-Handshake =========================
 
+// Schreiben mit Antwort, ohne BLEClientCharacteristic::write_resp():
+// Die Bibliothek wartet dort nur 100 ms und loescht danach ihre Semaphore, waehrend der
+// (hoeher priore) BLE-Task bei einer verspaeteten Antwort genau diese Semaphore noch
+// freigeben kann -> Speicher kaputt -> sporadischer HardFault (z.B. "Absturz 00000000").
+// Hier: eigene Flags, die der BLE-Ereignis-Callback setzt, und laengeres Timeout.
+static volatile uint16_t wrWaitHandle = BLE_GATT_HANDLE_INVALID;
+static volatile int32_t  wrResult = -1;          // -1 offen, sonst GATT-Status (0 = ok)
+static const int32_t     WR_ABORTED = 0x10000;   // Verbindung weg
+
+static void onBleEvent(ble_evt_t *e) {          // laeuft im BLE-Task: nur Flags setzen!
+  switch (e->header.evt_id) {
+    case BLE_GATTC_EVT_WRITE_RSP:
+      if (wrWaitHandle != BLE_GATT_HANDLE_INVALID && e->evt.gattc_evt.params.write_rsp.handle == wrWaitHandle)
+        wrResult = e->evt.gattc_evt.gatt_status;
+      break;
+    case BLE_GATTC_EVT_TIMEOUT:
+    case BLE_GAP_EVT_DISCONNECTED:
+      if (wrWaitHandle != BLE_GATT_HANDLE_INVALID) wrResult = WR_ABORTED;
+      break;
+    default: break;
+  }
+}
+
+static bool gattWrite(BLEClientCharacteristic &c, const uint8_t *d, uint16_t len) {
+  uint16_t h = connHandle, vh = c.valueHandle();
+  if (h == BLE_CONN_HANDLE_INVALID || vh == BLE_GATT_HANDLE_INVALID || disconnected) return false;
+  BLEConnection *conn = Bluefruit.Connection(h);
+  static uint8_t buf[32];                       // bleibt gueltig, auch wenn die Antwort spaet kommt
+  if (!conn || len + 3 > conn->getMtu() || len > sizeof(buf)) return false;
+  memcpy(buf, d, len);
+  ble_gattc_write_params_t p = {};
+  p.write_op = BLE_GATT_OP_WRITE_REQ;
+  p.handle   = vh;
+  p.len      = len;
+  p.p_value  = buf;
+  wrResult = -1;
+  wrWaitHandle = vh;
+  uint32_t err = sd_ble_gattc_write(h, &p);   // NRF_ERROR_BUSY: alte Anfrage noch offen
+  if (err != NRF_SUCCESS) { wrWaitHandle = BLE_GATT_HANDLE_INVALID; return false; }
+  uint32_t t0 = millis();
+  while (wrResult == -1 && !disconnected && millis() - t0 < GATT_WRITE_TIMEOUT_MS) {
+    gpsUpdate();                                // NMEA-Puffer nicht ueberlaufen lassen
+    delay(2);
+  }
+  wrWaitHandle = BLE_GATT_HANDLE_INVALID;       // spaete Antworten ignorieren
+  return wrResult == BLE_GATT_STATUS_SUCCESS;
+}
+
 static bool writeChr(BLEClientCharacteristic &c, const char *name, const uint8_t *d, uint16_t len) {
-  bool ok = c.write_resp(d, len) == len;
+  bool ok = gattWrite(c, d, len);
   Serial.printf("  -> %s: ", name);
   printHex(d, len);
   Serial.println(ok ? "  ok" : TR("  FEHLER", "  ERROR"));
@@ -1055,6 +1140,12 @@ static bool fail(const char *msg) {
   return false;
 }
 
+// Bluefruit loescht das BLEConnection-Objekt sofort beim Trennen (der Disconnect-Callback
+// kommt erst spaeter) -> Zeiger nie aufheben, sondern jedes Mal neu holen.
+static BLEConnection *liveConn(uint16_t h) {
+  return disconnected ? nullptr : Bluefruit.Connection(h);
+}
+
 static bool connectAndPair() {
   uint16_t h = connHandle;
   pairResult = -1;
@@ -1071,14 +1162,14 @@ static bool connectAndPair() {
   // Bluefruit verschluesselt mit vorhandenem Bond automatisch beim Verbinden.
   // requestPairing() stoesst ein neues Pairing nur an und wartet NICHT -> selbst warten.
   uint32_t ts = millis();
-  while (!conn->secured() && !disconnected && millis() - ts < 1500) delay(10);
-  bool secOk = conn->secured();
+  while (!disconnected && (conn = liveConn(h)) && !conn->secured() && millis() - ts < 1500) delay(10);
+  bool secOk = (conn = liveConn(h)) && conn->secured();
   if (!secOk && !disconnected) {
     authStatus = -1;
-    if (conn->requestPairing()) {
+    if ((conn = liveConn(h)) && conn->requestPairing()) {
       ts = millis();
       while (authStatus == -1 && !disconnected && millis() - ts < 15000) delay(10);
-      secOk = authStatus == BLE_GAP_SEC_STATUS_SUCCESS && conn->secured();
+      secOk = authStatus == BLE_GAP_SEC_STATUS_SUCCESS && (conn = liveConn(h)) && conn->secured();
       if (authStatus > 0) Serial.printf(TR("Pairing-Status: 0x%02x\n", "Pairing status: 0x%02x\n"), authStatus);
     }
   }
@@ -1094,7 +1185,7 @@ static bool connectAndPair() {
   secureFails = 0;
   delay(200);   // Kamera nach dem Verschluesseln kurz in Ruhe lassen
   Serial.printf(TR("Verschluesselung: ja, gebondet: %s\n", "Encrypted: yes, bonded: %s\n"),
-                conn->bonded() ? TR("ja", "yes") : TR("nein", "no"));
+                (conn = liveConn(h)) && conn->bonded() ? TR("ja", "yes") : TR("nein", "no"));
 
   // Bekannte Kamera: nur GPS-Meldungen abonnieren, keine Pairing-Abfrage senden
   lastWasMinimal = false;
@@ -1148,14 +1239,17 @@ static bool connectAndPair() {
     Serial.printf("Pairing %s.\n", disconnected ? TR("abgebrochen (Kamera hat getrennt)", "aborted (camera disconnected)")
                                    : pairResult == PAIR_REJECT ? TR("abgelehnt", "rejected")
                                                                : TR("nicht bestaetigt", "not confirmed"));
-    if (pairResult == PAIR_REJECT || !stored) conn->removeBondKey();
+    if (pairResult == PAIR_REJECT || !stored) {
+      if ((conn = liveConn(h))) conn->removeBondKey();
+      else bond_remove_key(BLE_GAP_ROLE_CENTRAL, &peer);   // Verbindung schon weg
+    }
     if (stored && !known) needConfirm = false;
     return fail("");
   }
   Serial.printf(TR("Pairing akzeptiert (nach %lu ms).\n", "Pairing accepted (after %lu ms).\n"), (unsigned long)(millis() - t0));
   {
     char pn[24] = "";
-    if (conn->getPeerName(pn, sizeof(pn)) && pn[0]) strncpy(seenName, pn, sizeof(seenName) - 1);
+    if ((conn = liveConn(h)) && conn->getPeerName(pn, sizeof(pn)) && pn[0]) strncpy(seenName, pn, sizeof(seenName) - 1);
   }
   if (!known) needConfirm = false;
   if (!stored || strcmp(persist.camName, seenName) != 0) {
@@ -1203,7 +1297,7 @@ static bool sendGeo(const GpsFix &f) {
   pkt[11] = f.alt < 0 ? '-' : '+';
   v = fabs(f.alt); memcpy(pkt + 12, &v, 4);
   memcpy(pkt + 16, &f.epoch, 4);
-  bool ok = geoChr.write_resp(pkt, sizeof(pkt)) == sizeof(pkt);
+  bool ok = gattWrite(geoChr, pkt, sizeof(pkt));
   Serial.print(ok ? TR("-> Position gesendet: ", "-> Position sent: ") : TR("-> Senden FEHLGESCHLAGEN: ", "-> Sending FAILED: "));
   printHex(pkt, sizeof(pkt));
   Serial.println();
@@ -1237,6 +1331,9 @@ static void printStatus() {
                 gnssFound ? "ok" : TR("nicht gefunden", "not found"), (unsigned long)gps.passedChecksum(),
                 (unsigned long)gps.failedChecksum());
   printFix(gpsRead());
+  Serial.printf(TR("Freier Stack: loop %lu B, Callback %lu B (min.)\n", "Free stack: loop %lu B, callback %lu B (min.)\n"),
+                (unsigned long)(uxTaskGetStackHighWaterMark(NULL) * 4), (unsigned long)cbStackFree);
+  printCrash();
 }
 
 static void handleSerial() {
@@ -1244,6 +1341,7 @@ static void handleSerial() {
     char c = Serial.read();
     switch (c) {
       case 's': printStatus(); break;
+      case 'c': crashClear(); break;                                        // Absturzprotokoll loeschen
       case 'r': if (Bluefruit.connected(connHandle)) Bluefruit.disconnect(connHandle); break;
       case 'l': toggleLang(); break;
       case 'D': demoMode = !demoMode; Serial.printf("Demo mode: %s\n", demoMode ? "on" : "off"); displayWake(); break;
@@ -1285,19 +1383,65 @@ static void handleSerial() {
 // Bei einem HardFault Absturzstelle merken und neu starten (statt stehen zu bleiben).
 // Der Bereich liegt ausserhalb von .data/.bss und uebersteht daher einen Software-Reset.
 struct CrashInfo {
-  uint32_t magic, type, pc, lr, cfsr, hfsr, count, reported, check;   // type: 1 HardFault, 2 Watchdog
+  uint32_t magic, type, pc, lr, cfsr, hfsr, count, reported;   // type: 1 HardFault, 2 Watchdog
+  uint32_t task[2];                                            // Name des laufenden Tasks ("ISR" = Interrupt)
+  uint32_t check;
 };
-static const uint32_t CRASH_MAGIC = 0xC0A5F417;
+static const uint32_t CRASH_MAGIC = 0xC0A5F418;
 // Feste Adresse weit oben im RAM: der Bootloader (laeuft bei jedem Reset) nutzt den unteren
 // RAM und loescht ihn; App-Stack liegt bei 0x2003F800..0x20040000, der Heap waechst von unten.
 static volatile CrashInfo &crash = *reinterpret_cast<volatile CrashInfo *>(0x2003E000);
 static uint32_t crashSum() {
-  return crash.type ^ crash.pc ^ crash.lr ^ crash.cfsr ^ crash.hfsr ^ crash.count ^ crash.reported ^ CRASH_MAGIC;
+  return crash.type ^ crash.pc ^ crash.lr ^ crash.cfsr ^ crash.hfsr ^ crash.count ^ crash.reported ^
+         crash.task[0] ^ crash.task[1] ^ CRASH_MAGIC;
 }
 static bool crashValid() { return crash.magic == CRASH_MAGIC && crash.check == crashSum(); }
 
-static void crashRecord(uint32_t type, uint32_t *sp) {
+static void crashTask(char *out) {           // 8 Byte inkl. Null
+  memcpy(out, (const void *)crash.task, 8);
+  out[7] = 0;
+}
+
+static void printCrash() {
+  if (!haveCrash) { Serial.println(TR("Kein Absturz gespeichert.", "No crash recorded.")); return; }
+  char t[8];
+  crashTask(t);
+  Serial.printf(TR("!!! Letzter Neustart #%lu durch %s im Task \"%s\": PC=0x%08lx LR=0x%08lx CFSR=0x%08lx HFSR=0x%08lx\n",
+                   "!!! Last reset #%lu by %s in task \"%s\": PC=0x%08lx LR=0x%08lx CFSR=0x%08lx HFSR=0x%08lx\n"),
+                (unsigned long)crash.count, crash.type == 2 ? TR("Watchdog (Programm hing)", "watchdog (program hung)") : "HardFault",
+                t, (unsigned long)crash.pc, (unsigned long)crash.lr, (unsigned long)crash.cfsr, (unsigned long)crash.hfsr);
+}
+
+// Drei Zeilen fuer die Seite "Geraet" (je max. 21 Zeichen)
+static void crashLine(uint8_t i, char *out, size_t n) {
+  const char *kind = crash.type == 2 ? "WDT" : TR("Absturz", "Crash");
+  char t[8];
+  crashTask(t);
+  if (i == 0)      snprintf(out, n, "%s %08lX", kind, (unsigned long)crash.pc);
+  else if (i == 1) snprintf(out, n, "LR %08lX %s", (unsigned long)crash.lr, t);
+  else             snprintf(out, n, "CFSR %08lX #%lu", (unsigned long)crash.cfsr, (unsigned long)crash.count);
+}
+
+static void crashClear() {
+  crash.magic = 0;
+  haveCrash = false;
+  Serial.println(TR("Absturzprotokoll geloescht.", "Crash log cleared."));
+}
+
+static void crashRecord(uint32_t type, uint32_t *sp, uint32_t excReturn) {
   uint32_t cnt = crashValid() ? crash.count + 1 : 1;
+  char name[8] = "ISR";
+  if (excReturn & 4) {                         // Fehler im Task (PSP): dessen Namen merken
+    TaskHandle_t t = xTaskGetCurrentTaskHandle();
+    uint32_t a = (uint32_t)t;
+    if (a >= 0x20000000 && a < 0x20040000) {
+      const char *n = pcTaskGetName(t);
+      for (int i = 0; i < 7 && n[i] >= ' ' && n[i] <= '~'; i++) name[i] = n[i], name[i + 1] = 0;
+    } else {
+      strcpy(name, "?");
+    }
+  }
+  memcpy((void *)crash.task, name, sizeof(name));
   crash.type = type;
   crash.pc = sp[6];
   crash.lr = sp[5];
@@ -1309,12 +1453,12 @@ static void crashRecord(uint32_t type, uint32_t *sp) {
   crash.check = crashSum();
 }
 
-extern "C" __attribute__((used)) void hardFaultC(uint32_t *sp) {
-  crashRecord(1, sp);
+extern "C" __attribute__((used)) void hardFaultC(uint32_t *sp, uint32_t excReturn) {
+  crashRecord(1, sp, excReturn);
   NVIC_SystemReset();
 }
-extern "C" __attribute__((used)) void wdtC(uint32_t *sp) {
-  crashRecord(2, sp);          // Reset folgt automatisch durch den Watchdog
+extern "C" __attribute__((used)) void wdtC(uint32_t *sp, uint32_t excReturn) {
+  crashRecord(2, sp, excReturn);          // Reset folgt automatisch durch den Watchdog
   while (true) {}
 }
 
@@ -1324,6 +1468,7 @@ extern "C" __attribute__((naked)) void HardFault_Handler(void) {
       "ite eq          \n"
       "mrseq r0, msp   \n"
       "mrsne r0, psp   \n"
+      "mov r1, lr      \n"
       "b hardFaultC    \n");
 }
 // Watchdog-Interrupt kommt kurz vor dem Reset: Stelle merken, an der das Programm hing
@@ -1333,6 +1478,7 @@ extern "C" __attribute__((naked)) void WDT_IRQHandler(void) {
       "ite eq          \n"
       "mrseq r0, msp   \n"
       "mrsne r0, psp   \n"
+      "mov r1, lr      \n"
       "b wdtC          \n");
 }
 
@@ -1358,14 +1504,8 @@ void setup() {
   Serial.printf("Reset-Grund: 0x%08lx\n", (unsigned long)resetReason);
   // Absturzprotokoll (der Bootloader loescht RESETREAS, daher eigener Merker im RAM)
   if (crashValid()) {
-    const char *what = crash.type == 2 ? TR("Watchdog (Programm hing)", "watchdog (program hung)")
-                                       : "HardFault";
-    Serial.printf(TR("!!! Letzter Neustart #%lu durch %s: PC=0x%08lx LR=0x%08lx CFSR=0x%08lx HFSR=0x%08lx\n",
-                     "!!! Last reset #%lu by %s: PC=0x%08lx LR=0x%08lx CFSR=0x%08lx HFSR=0x%08lx\n"),
-                  (unsigned long)crash.count, what, (unsigned long)crash.pc, (unsigned long)crash.lr,
-                  (unsigned long)crash.cfsr, (unsigned long)crash.hfsr);
-    snprintf(lastResetInfo, sizeof(lastResetInfo), "%s %08lX", crash.type == 2 ? "WDT" : TR("Absturz", "Crash"),
-             (unsigned long)crash.pc);
+    haveCrash = true;
+    printCrash();
     if (!crash.reported) { crash.reported = 1; crash.check = crashSum(); }
   }
   wdtStart();
@@ -1402,6 +1542,7 @@ void setup() {
   geoInd.begin();
   geoInd.setIndicateCallback(onGeoIndication);
 
+  Bluefruit.setEventCallback(onBleEvent);
   Bluefruit.Central.setConnectCallback(onConnect);
   Bluefruit.Central.setDisconnectCallback(onDisconnect);
   Bluefruit.Scanner.setRxCallback(onScan);
@@ -1468,9 +1609,32 @@ void loop() {
         }
         break;
       }
-      // laufenden Verbindungsaufbau nicht durch neuen Scan stoeren (max. 5 s)
-      if (connectingSince && millis() - connectingSince < 5000) break;
-      connectingSince = 0;
+      // laufenden Verbindungsaufbau nicht durch neuen Scan stoeren (max. CONNECT_TIMEOUT_MS)
+      if (connectingSince && millis() - connectingSince < CONNECT_TIMEOUT_MS) break;
+      if (connectingSince) {
+        connectingSince = 0;
+        // Bluefruit verbindet ohne Timeout und haelt den Scanner fuer "laufend", obwohl er steht.
+        // Ohne Abbruch: keine Werbepakete mehr (Anzeige "Suche Kamera..." statt "Kamera aus"),
+        // und die Verbindung kommt irgendwann spaeter von selbst zustande (weckt die Kamera).
+        if (!connPending && !Bluefruit.Central.connected()) {
+          uint32_t err = sd_ble_gap_connect_cancel();
+          Serial.printf(TR("Verbindungsaufbau abgebrochen (0x%lx), suche weiter.\n",
+                           "Connection attempt cancelled (0x%lx), scanning again.\n"), (unsigned long)err);
+          Bluefruit.Scanner.start(0);   // setzt auch den "laeuft"-Merker der Bibliothek
+          lastAdvAt = millis();
+        }
+        break;
+      }
+      // Sicherheitsnetz: Scanner "laeuft", liefert aber nichts mehr -> neu starten
+      if (Bluefruit.Scanner.isRunning() && !connPending && !Bluefruit.Central.connected() &&
+          millis() - lastAdvAt > SCAN_STALL_MS) {
+        Serial.println(TR("Keine Werbepakete mehr -> Scanner neu gestartet.", "No adverts any more -> scanner restarted."));
+        Bluefruit.Scanner.stop();
+        sd_ble_gap_connect_cancel();
+        Bluefruit.Scanner.start(0);
+        lastAdvAt = millis();
+        break;
+      }
       // Pause nach "Kamera aus?" bzw. Diagnose: nur zuhoeren und Werbepakete zaehlen
       listenOnly = listenForced || (int32_t)(millis() - scanHoldUntil) < 0;
       {
@@ -1524,14 +1688,30 @@ void loop() {
         writeChr(geoChr, TR("GPS-Freigabe", "GPS enable"), &en, 1);
       }
       if (geoEnabled) {
+        // Nach dem Verbinden (und wenn der Fix wiederkommt) die Position sofort senden,
+        // unabhaengig vom Intervall; bis es klappt alle FIRST_SEND_RETRY_MS erneut versuchen.
+        static bool sendNow = false, hadFix = false;
+        static uint32_t lastTry = 0;
+        uint32_t now = millis();
         if (state != State::RUNNING) {
           Serial.println(TR("Kamera akzeptiert GPS-Daten.", "Camera accepts GPS data."));
           state = State::RUNNING;
-          lastGeoSend = 0;
+          sendNow = true;
+          hadFix = false;
+          lastTry = 0;
+          lastGeoSend = now;
         }
-        if (lastGeoSend == 0 || millis() - lastGeoSend >= sendIntervalMs()) {
-          lastGeoSend = millis() | 1;
-          GpsFix f = gpsRead();
+        GpsFix f = gpsRead();
+        if (f.valid && !hadFix) sendNow = true;   // Fix (wieder) da -> gleich senden
+        hadFix = f.valid;
+        if (sendNow && f.valid) {
+          if (lastTry == 0 || now - lastTry >= FIRST_SEND_RETRY_MS) {
+            lastTry = now | 1;
+            printFix(f);
+            if (sendGeo(f)) { sendNow = false; lastGeoSend = now; lastTry = 0; }
+          }
+        } else if (now - lastGeoSend >= sendIntervalMs()) {
+          lastGeoSend = now;
           printFix(f);
           if (f.valid) sendGeo(f);   // ohne Fix nichts senden
         }

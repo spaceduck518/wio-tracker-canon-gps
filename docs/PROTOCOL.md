@@ -99,7 +99,9 @@ What does differ is the **advertising rate**:
 
 The firmware therefore counts adverts in 3-second windows and only connects when the camera
 advertises fast (≥ 9 per 3 s). After the camera itself dropped an active connection, it waits
-45 s before trusting a fast rate again. Result: no connection attempts – and no clicking –
+up to 45 s before trusting a fast rate again – but as soon as two full 3-second windows show the
+slow rate (camera really off), the wait ends, so switching the camera back on is detected
+within a few seconds. Result: no connection attempts – and no clicking –
 while the camera is off; connection within a few seconds after switching it on.
 
 Also: furble writes `0x02` (shooting mode) to `00030010` after connecting. That is not needed

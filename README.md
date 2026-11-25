@@ -298,6 +298,7 @@ USB serial, 115200 baud (any terminal; the Arduino serial monitor works). Comman
 | `l` | toggle language |
 | `h` | listen-only diagnostic: never connect, print the camera's advert rate every 10 s |
 | `Z` | deliberately crash (tests the crash log) |
+| `c` | clear the crash log |
 | `D` | demo mode on/off (example position, camera name and address – for screenshots) |
 | `v` | next display page |
 | `k` | next entry in the settings menu |
@@ -364,10 +365,12 @@ with the numbers.
 
 <a id="crash-or-watchdog-message-on-the-device-page"></a>
 **Crash or watchdog message on the device page** (`Crash 0002A202` / `WDT 0003DD81`) – the
-firmware hit a fault and restarted itself. Please open an issue with the line (a photo is fine),
+firmware hit a fault and restarted itself. The last line of the device page cycles every 2.5 s
+through the crashing address (PC), the caller (LR) plus the task name, and the fault status
+(CFSR) plus the number of restarts. Please open an issue with all three lines (a photo is fine),
 the firmware version (printed at startup and with `s`), and what the device was doing. The serial console prints more registers on
 startup. The address can be mapped to a source line with `arm-none-eabi-addr2line -e <the .elf
-of that build>` – for the prebuilt firmware that is [`prebuilt/CanonGPS_L1.elf`](prebuilt/CanonGPS_L1.elf). The crash log survives automatic restarts but not power-off.
+of that build>` – for the prebuilt firmware that is [`prebuilt/CanonGPS_L1.elf`](prebuilt/CanonGPS_L1.elf). The crash log survives automatic restarts but not power-off. `s` prints it again, `c` clears it.
 
 **Weird pixels at the right edge / first column cut off** – wrong display driver. The L1 needs
 `OLED_SH1106 1` (default in this firmware).
